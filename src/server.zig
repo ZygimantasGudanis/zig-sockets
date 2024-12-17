@@ -7,105 +7,6 @@ const print = std.debug.print;
 const socket_t = posix.socket_t;
 const Allocator = std.mem.Allocator;
 
-pub const ChatServer = struct {
-    allocator: std.mem.Allocator,
-    socket: posix.socket_t,
-
-    connections: std.ArrayList(socket_t),
-    maxConns: u8,
-    new_connections: std.ArrayList(socket_t),
-    buffer: u32,
-
-    worker_thread: std.Thread = undefined,
-    acceptConn_thread: std.Thread = undefined,
-    isWorking: bool = false,
-    pub fn init(allocator: std.mem.Allocator, buffer: u32, maxConns: u8) !*ChatServer {
-        const server = try allocator.create(ChatServer);
-        server.*.connections = std.ArrayList(socket_t).init(allocator);
-        server.*.new_connections = std.ArrayList(socket_t).init(allocator);
-        server.*.maxConns = maxConns;
-        server.*.buffer = buffer;
-
-        const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 5101);
-        const socket = try std.posix.socket(
-            address.any.family,
-            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-            std.posix.IPPROTO.TCP,
-        );
-        try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try std.posix.bind(socket, &address.any, address.getOsSockLen());
-        try std.posix.listen(socket, 128);
-
-        server.*.socket = socket;
-        return server;
-    }
-
-    pub fn deinit(self: *ChatServer) void {
-        //self.allocator.free(self.connections[0..]);
-        try self.stopServer();
-
-        posix.close(self.*.socket);
-
-        for (self.*.connections.items) |sock| {
-            posix.close(sock);
-        }
-
-        for (self.*.new_connections.items) |sock| {
-            posix.close(sock);
-        }
-        self.*.connections.deinit();
-        self.*.new_connections.deinit();
-        self.* = undefined;
-    }
-
-    pub fn startServer(self: *ChatServer) !void {
-        self.*.isWorking = true;
-
-        self.*.worker_thread = try std.Thread.spawn(.{}, workerLoop, .{self});
-    }
-
-    pub fn stopServer(self: *ChatServer) !void {
-        if (self.*.isWorking) {
-            self.*.isWorking = false;
-            self.*.worker_thread.join();
-            self.*.acceptConn_thread.join();
-        }
-    }
-
-    fn workerLoop(self: *ChatServer) !void {
-        var arenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        //const alloc = arenaAllocator.allocator();
-        defer arenaAllocator.deinit();
-
-        while (self.*.isWorking) {}
-    }
-
-    fn writeMessageVec(socket: *socket_t, msg: []const u8) !void {
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u8, &buf, @intCast(msg.len), .little);
-
-        var vec = [2]posix.iovec_const{
-            .{ .len = buf.len, .base = &buf },
-            .{ .len = msg.len, .base = msg.ptr },
-        };
-        try writeAllVec(socket, &vec);
-    }
-
-    fn writeAllVec(socket: *socket_t, vec: []posix.iovec_const) !void {
-        var i: usize = 0;
-        while (true) {
-            var n = try posix.writev(socket.*, vec[i..]);
-            while (n >= vec[i].len) {
-                n -= vec[i].len;
-                i += 1;
-                if (i >= vec.len) return;
-            }
-            vec[i].base += n;
-            vec[i].len -= n;
-        }
-    }
-};
-
 const Reader = struct {
     buf: []u8,
 
@@ -115,10 +16,20 @@ const Reader = struct {
     //Message starts at
     start: usize = 0,
 
-    // Read from
-    socket: socket_t,
+    pub fn init(allocator: Allocator, size: usize) !Reader {
+        const buf = try allocator.alloc(u8, size);
+        return .{
+            .buf = buf,
+            .pos = 0,
+            .start = 0,
+        };
+    }
 
-    pub fn readMessage(self: *Reader) ![]u8 {
+    pub fn deinit(self: *const Reader, allocator: Allocator) void {
+        allocator.free(self.buf);
+    }
+
+    pub fn readMessage(self: *Reader, socket: socket_t) ![]u8 {
         var buf = self.buf;
         while (true) {
             if (try self.bufferedMessage()) |msg| {
@@ -126,9 +37,8 @@ const Reader = struct {
             }
 
             const pos = self.pos;
-            const n = try posix.read(self.socket, buf[pos..]);
+            const n = try posix.read(socket, buf[pos..]);
             if (n == 0) return error.Closed;
-
             self.pos = pos + n;
         }
     }
@@ -172,153 +82,149 @@ const Reader = struct {
     }
 };
 
-pub fn loop() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    //defer gpa.deinit();
-    const allocator = gpa.allocator();
+const Client = struct {
+    socket: socket_t,
+    address: net.Address,
+    reader: Reader,
 
-    var pool: std.Thread.Pool = undefined;
-    try std.Thread.Pool.init(&pool, .{ .allocator = allocator, .n_jobs = 64 });
-    defer pool.deinit();
-
-    const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 5101);
-    const socket = try std.posix.socket(
-        address.any.family,
-        std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
-        std.posix.IPPROTO.TCP,
-    );
-    defer posix.close(socket);
-    try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try std.posix.bind(socket, &address.any, address.getOsSockLen());
-    try std.posix.listen(socket, 128);
-
-    var buf: [128]u8 = undefined;
-    while (true) {
-        const clientSocket = posix.accept(socket, null, null, posix.SOCK.NONBLOCK) catch |err| {
-            if (err == error.WouldBlock) {
-                std.Thread.sleep(1_000_000);
-                continue;
-            }
-            print("Error accept {}\n", .{err});
-            continue;
+    pub fn init(allocator: Allocator, socket: socket_t, address: net.Address) !Client {
+        const reader = try Reader.init(allocator, 4096);
+        return .{
+            .address = address,
+            .socket = socket,
+            .reader = reader,
         };
-        defer posix.close(clientSocket);
-        // const client = Client{ .socket = clientSocket, .address = client_address };
-        // try pool.spawn(Client.handle, .{client});
-
-        const stream = net.Stream{ .handle = clientSocket };
-        const read = try stream.read(&buf);
-        if (read == 0) {
-            continue;
-        }
-        try stream.writeAll(buf[0..read]);
     }
-}
+    pub fn deinit(self: *const Client, allocator: Allocator) void {
+        self.reader.deinit(allocator);
+    }
 
-pub fn loop2() !void {
-    const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 5101);
-    const socket = try std.posix.socket(
-        address.any.family,
-        std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-        std.posix.IPPROTO.TCP,
-    );
-    defer posix.close(socket);
-    try std.posix.setsockopt(socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try std.posix.bind(socket, &address.any, address.getOsSockLen());
-    try std.posix.listen(socket, 128);
+    pub fn readMessage(self: *Client) !?[]const u8 {
+        return self.reader.readMessage(self.socket) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            else => return err,
+        };
+    }
+};
 
-    // Our server can support 4095 clients. Wait, shouldn't that be 4096? No
-    // One of the polling slots (the first one) is reserved for our listening
-    // socket.
-    var polls: [4096]posix.pollfd = undefined;
-    polls[0] = .{
-        .fd = socket,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    };
-    var poll_count: usize = 1;
-    print("Starting server...\n", .{});
-    while (true) {
-        var active = polls[0..poll_count];
-        // 2nd argument is the timeout, -1 is infinity
-        _ = try posix.poll(active, -1);
+pub const Server = struct {
+    allocator: std.mem.Allocator,
+    connected: usize,
+    polls: []posix.pollfd,
+    clients: []Client,
+    client_polls: []posix.pollfd,
 
-        if (active[0].revents != 0) {
-            const clientSocket = posix.accept(socket, null, null, posix.SOCK.NONBLOCK) catch |err| switch (err) {
-                error.WouldBlock => {
-                    continue;
-                },
-                else => {
-                    unreachable;
-                },
+    pub fn init(allocator: std.mem.Allocator, max: usize) !Server {
+        const polls = try allocator.alloc(posix.pollfd, max + 1);
+        errdefer allocator.free(polls);
+
+        const clients = try allocator.alloc(Client, max);
+        errdefer allocator.free(clients);
+
+        return .{
+            .polls = polls,
+            .clients = clients,
+            .client_polls = polls[1..],
+            .connected = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.allocator.free(self.polls);
+        self.allocator.free(self.clients);
+    }
+
+    pub fn accept(self: *Server, socket: socket_t) !void {
+        while (true) {
+            var address: net.Address = undefined;
+            var address_len: posix.socklen_t = @sizeOf(net.Address);
+            const clientSocket = posix.accept(socket, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
             };
-            polls[poll_count] = .{
+            const client = Client.init(self.allocator, clientSocket, address) catch |err| {
+                posix.close(clientSocket);
+                print("{}\n", .{err});
+                return;
+            };
+            const connected = self.connected - 1;
+            self.clients[connected] = client;
+            const poll = posix.pollfd{
                 .fd = clientSocket,
                 .revents = 0,
                 .events = posix.POLL.IN,
             };
+            self.client_polls[connected] = poll;
 
-            poll_count += 1;
+            print("Cklieant , {}, {}, {}\n", .{ self.client_polls[connected].revents, self.client_polls[connected].events, posix.POLL.IN });
+            self.connected += 1;
         }
+    }
+    pub fn removeClient(self: *Server, at: usize) void {
+        var client = self.clients[at];
+        posix.close(client.socket);
+        client.deinit(self.allocator);
 
-        var i: usize = 1;
-        while (i < active.len) {
-            const polled = active[i];
-            const revents = polled.revents;
-            if (revents == 0) {
-                i += 1;
-                continue;
+        self.clients[at] = self.clients[self.connected - 1];
+        self.client_polls[at] = self.client_polls[self.connected - 1];
+
+        self.connected -= 1;
+    }
+
+    pub fn run(self: *Server) !void {
+        const address = try std.net.Address.parseIp("127.0.0.1", 5101);
+        const tpe = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
+        const protocol = posix.IPPROTO.TCP;
+        const server = try posix.socket(address.any.family, tpe, protocol);
+
+        try posix.setsockopt(server, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.bind(server, &address.any, address.getOsSockLen());
+        try posix.listen(server, 128);
+
+        self.polls[0] = .{
+            .fd = server,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        };
+        self.connected = 1;
+
+        print("Starting server...\n", .{});
+        while (true) {
+            // 2nd argument is the timeout, -1 is infinity
+            _ = try posix.poll(self.polls[0..self.connected], 100);
+            print("Cklieant , {}, {}, {}\n", .{ self.polls[0].revents, self.polls[0].events, posix.POLL.IN });
+            if (self.polls[0].revents != 0) {
+                print("Starting server...\n", .{});
+                self.accept(server) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        continue;
+                    },
+                    else => return err,
+                };
             }
+            var i: usize = 0;
+            while (i < self.connected - 1) {
+                const polled = self.client_polls[i];
+                if (polled.events == 0) {
+                    i += 1;
+                    continue;
+                }
 
-            var closed = false;
-            // print("New COnnection...{}, {}, {}\n", .{revents, polled.events, posix.POLL.IN});
-            if (polled.events & posix.POLL.IN == posix.POLL.IN) {
-                var buf: [4096]u8 = undefined;
-                const read = posix.read(polled.fd, &buf) catch 0;
-                if (read == 0) {
-                    closed = true;
-                } else {
-                    print("[{d}] got: {any}\n", .{ polled.fd, buf[0..read] });
+                if (polled.events & posix.POLL.IN == posix.POLL.IN) {
+                    var client = &self.clients[i];
+                    while (true) {
+                        const msg = client.readMessage() catch {
+                            self.removeClient(i);
+                            break;
+                        } orelse {
+                            i += 1;
+                            break;
+                        };
+                        print("got: {s}\n", .{msg});
+                    }
                 }
             }
-
-            if (closed or (revents & posix.POLL.HUP == posix.POLL.HUP)) {
-                const last_index = active.len - 1;
-                active[i] = active[last_index];
-                active = active[0..last_index];
-                poll_count -= 1;
-            } else {
-                i += 1;
-            }
-        }
-    }
-}
-
-const Client = struct {
-    socket: socket_t,
-    address: net.Address,
-
-    pub fn handle(self: Client) void {
-        self._handle() catch |err| switch (err) {
-            error.Closed => {},
-            error.WouldBlock => {},
-            else => print("[{any}] client unhandled error: {}\n", .{ self.address, err }),
-        };
-    }
-
-    fn _handle(self: Client) !void {
-        const socket = self.socket;
-        defer posix.close(socket);
-        const timeout = posix.timeval{ .sec = 2, .usec = 500_00 };
-        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
-        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
-
-        var buf: [1024]u8 = undefined;
-        var reader = Reader{ .pos = 0, .buf = &buf, .socket = socket };
-
-        while (true) {
-            const msg = try reader.readMessage();
-            print("Got: {s}\n", .{msg});
         }
     }
 };
