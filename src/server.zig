@@ -227,8 +227,6 @@ pub const Server = struct {
                             i += 1;
                             break;
                         };
-                        i += 1;
-                        self.polls[0].revents = 0;
                         print("got: {s}\n", .{msg});
                         break;
                     }
