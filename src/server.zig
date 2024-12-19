@@ -37,7 +37,6 @@ const Reader = struct {
             }
 
             const pos = self.pos;
-            print("Reading , {}\n", .{&socket});
             const n = posix.read(socket, buf[pos..]) catch |err| {
                 print("Error , {}\n", .{err});
                 return err;
@@ -147,12 +146,12 @@ pub const Server = struct {
                 error.WouldBlock => return,
                 else => return err,
             };
+            //const s = try posix.fcntl(clientSocket, std.posix.F.SETFL, posix.SOCK.NONBLOCK);
             const client = Client.init(self.allocator, clientSocket, address) catch |err| {
                 posix.close(clientSocket);
                 print("{}\n", .{err});
                 return;
             };
-
             const connected = self.connected;
             self.clients[connected] = client;
             const poll = posix.pollfd{
@@ -161,7 +160,7 @@ pub const Server = struct {
                 .events = posix.POLL.IN,
             };
             self.client_polls[connected] = poll;
-            print("Cklieant , {}, {}, {}\n", .{ self.client_polls[connected].revents, self.client_polls[connected].events, posix.POLL.IN });
+            print("Client , {}, {}, {}, {any}\n", .{ self.client_polls[connected].revents, self.client_polls[connected].events, posix.POLL.IN, posix.POLL.IN });
             self.connected += 1;
         }
     }
@@ -196,7 +195,7 @@ pub const Server = struct {
         print("Starting server...\n", .{});
         while (true) {
             // 2nd argument is the timeout, -1 is infinity
-            _ = try posix.poll(self.polls[0 .. self.connected + 1], 100);
+            _ = try posix.poll(self.polls[0 .. self.connected + 1], -1);
 
             if (self.polls[0].revents != 0) {
                 print("Starting server...\n", .{});
@@ -208,10 +207,9 @@ pub const Server = struct {
                 };
             }
             var i: usize = 0;
-            print("Looping , {}, {}, {}\n", .{ self.polls[0].revents, self.polls[0].events, posix.POLL.IN });
             while (i < self.connected) {
                 const polled = self.client_polls[i];
-                if (polled.events == 0) {
+                if (polled.revents == 0) {
                     i += 1;
                     continue;
                 }
@@ -227,7 +225,8 @@ pub const Server = struct {
                             i += 1;
                             break;
                         };
-                        print("got: {s}\n", .{msg});
+                        if (msg.len < 4096) i += 1;
+                        print("Connected = {}, Event = {}, Revent = {},  got: {s}\n", .{ self.connected, self.polls[i].events, self.polls[i].revents, msg });
                         break;
                     }
                 }
