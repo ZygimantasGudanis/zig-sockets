@@ -16,6 +16,7 @@ const Reader = struct {
     //Message starts at
     start: usize = 0,
 
+    // Add to header total message size
     pub fn init(allocator: Allocator, size: usize) !Reader {
         const buf = try allocator.alloc(u8, size);
         return .{
