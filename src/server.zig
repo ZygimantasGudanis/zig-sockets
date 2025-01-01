@@ -9,11 +9,7 @@ const Allocator = std.mem.Allocator;
 
 const Reader = struct {
     buf: []u8,
-
-    //Position in the buffer
     pos: usize = 0,
-
-    //Message starts at
     start: usize = 0,
 
     // Add to header total message size
@@ -91,16 +87,32 @@ const Client = struct {
     address: net.Address,
     reader: Reader,
 
+    to_write: []u8,
+    write_buff: []u8,
+
+    read_timeout: i64,
+    read_timeout_node: *ClientNode,
+
     pub fn init(allocator: Allocator, socket: socket_t, address: net.Address) !Client {
         const reader = try Reader.init(allocator, 4096);
+        errdefer reader.deinit(allocator);
+
+        const write_buf = try allocator.alloc(u8, 4096);
+        errdefer allocator.free(write_buf);
+
         return .{
             .address = address,
             .socket = socket,
             .reader = reader,
+            .to_write = &.{},
+            .write_buff = write_buf,
+            .read_timeout = 0,
+            .read_timeout_node = undefined,
         };
     }
     pub fn deinit(self: *const Client, allocator: Allocator) void {
         self.reader.deinit(allocator);
+        allocator.free(self.write_buff);
     }
 
     pub fn readMessage(self: *Client) !?[]const u8 {
@@ -109,14 +121,59 @@ const Client = struct {
             else => return err,
         };
     }
+
+    pub fn writeMessage(self: *Client, msg: []u8) !bool {
+        if (self.to_write.len > 0) {
+            return error.PendingMessage;
+        }
+
+        if (msg.len + 4 > self.write_buff.len) {
+            return error.MessageTooLarge;
+        }
+
+        std.mem.writeInt(u32, self.write_buff[0..4], @intCast(msg.len), .little);
+        const end = msg.len + 4;
+        @memcpy(self.write_buff[4..end], msg);
+
+        self.to_write = self.write_buff[0..end];
+        return self.write();
+    }
+
+    pub fn write(self: *Client) !bool {
+        var buf = self.to_write;
+        defer self.to_write = buf;
+        while (buf.len > 0) {
+            const n = posix.write(self.socket, buf) catch |err| switch (err) {
+                error.WouldBlock => return false,
+                else => return err,
+            };
+
+            if (n == 0) {
+                return error.Closed;
+            }
+
+            buf = buf[n..];
+        } else {
+            return true;
+        }
+    }
 };
+
+// 1 minute
+const READ_TIMEOUT_MS = 60_000;
+const ClientList = std.DoublyLinkedList(*Client);
+const ClientNode = ClientList.Node;
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
     connected: usize,
     polls: []posix.pollfd,
-    clients: []Client,
+    clients: []*Client,
     client_polls: []posix.pollfd,
+    client_pool: std.heap.MemoryPool(Client),
+
+    read_timeout_list: ClientList,
+    client_node_pool: std.heap.MemoryPool(ClientList.Node),
 
     pub fn init(allocator: std.mem.Allocator, max: usize) !Server {
         const polls = try allocator.alloc(posix.pollfd, max + 1);
@@ -131,28 +188,48 @@ pub const Server = struct {
             .client_polls = polls[1..],
             .connected = 0,
             .allocator = allocator,
+            .client_pool = std.heap.MemoryPool(Client).init(allocator),
+            .client_node_pool = std.heap.MemoryPool(ClientNode).init(allocator),
         };
     }
 
     pub fn deinit(self: *Server) void {
         self.allocator.free(self.polls);
         self.allocator.free(self.clients);
+
+        self.client_pool.deinit(self.allocator);
+        self.client_node_pool.deinit(self.allocator);
     }
 
     pub fn accept(self: *Server, socket: socket_t) !void {
-        while (true) {
+        const space = self.client_pool.len - self.connected;
+        for (0..space) |_| {
             var address: net.Address = undefined;
             var address_len: posix.socklen_t = @sizeOf(net.Address);
             const clientSocket = posix.accept(socket, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
-            //const s = try posix.fcntl(clientSocket, std.posix.F.SETFL, posix.SOCK.NONBLOCK);
-            const client = Client.init(self.allocator, clientSocket, address) catch |err| {
+
+            const client = try self.client_pool.create();
+            errdefer self.client_pool.destroy(client);
+
+            client.* = Client.init(self.allocator, clientSocket, address) catch |err| {
                 posix.close(clientSocket);
                 print("{}\n", .{err});
                 return;
             };
+
+            client.read_timeout = std.time.milliTimestamp() + READ_TIMEOUT_MS;
+            client.read_timeout_node = try self.client_node_pool.create();
+            errdefer self.client_node_pool.destroy(client.read_timeout_node);
+            client.read_timeout_node.* = .{
+                .next = null,
+                .prev = null,
+                .data = client,
+            };
+            self.read_timeout_list.append(client.read_timeout_node);
+
             const connected = self.connected;
             self.clients[connected] = client;
             const poll = posix.pollfd{
@@ -165,15 +242,22 @@ pub const Server = struct {
             self.connected += 1;
         }
     }
+
     pub fn removeClient(self: *Server, at: usize) void {
         var client = self.clients[at];
-        posix.close(client.socket);
-        client.deinit(self.allocator);
+        defer {
+            posix.close(client.socket);
+            self.client_node_pool.destroy(client.read_timeout_node);
+            client.deinit(self.allocator);
+            self.client_pool(client);
+        }
+        const last_index = self.connected - 1;
+        self.clients[at] = self.clients[last_index];
+        self.client_polls[at] = self.client_polls[last_index];
 
-        self.clients[at] = self.clients[self.connected - 1];
-        self.client_polls[at] = self.client_polls[self.connected - 1];
-
-        self.connected -= 1;
+        self.connected = last_index;
+        self.polls[0].events = posix.POLL.IN;
+        self.read_timeout_list.remove(client.read_timeout_node);
     }
 
     pub fn run(self: *Server) !void {
@@ -194,9 +278,11 @@ pub const Server = struct {
         //self.connected = 1;
 
         print("Starting server...\n", .{});
+        var read_timeout_list = &self.read_timeout_list;
         while (true) {
+            const next_timeout = self.enforeTimeout();
             // 2nd argument is the timeout, -1 is infinity
-            _ = try posix.poll(self.polls[0 .. self.connected + 1], -1);
+            _ = try posix.poll(self.polls[0 .. self.connected + 1], next_timeout);
 
             if (self.polls[0].revents != 0) {
                 print("Starting server...\n", .{});
@@ -215,8 +301,8 @@ pub const Server = struct {
                     continue;
                 }
 
+                var client = self.clients[i];
                 if (polled.events & posix.POLL.IN == posix.POLL.IN) {
-                    var client = &self.clients[i];
                     while (true) {
                         const msg = client.readMessage() catch |err| {
                             print("Error , {}\n", .{err});
@@ -226,12 +312,52 @@ pub const Server = struct {
                             i += 1;
                             break;
                         };
+
+                        client.read_timeout = std.time.milliTimestamp() + READ_TIMEOUT_MS;
+                        read_timeout_list.remove(client.read_timeout_node);
+                        read_timeout_list.append(client.read_timeout_node);
+
+                        const written = client.writeMessage(msg) catch {
+                            self.removeClient(i);
+                            break;
+                        };
+                        if (written == false) {
+                            self.client_polls[i].events = posix.POLL.OUT;
+                            break;
+                        }
+
                         if (msg.len < 4096) i += 1;
                         print("Connected = {}, Event = {}, Revent = {},  got: {s}\n", .{ self.connected, self.polls[i].events, self.polls[i].revents, msg });
                         break;
                     }
+                } else if (polled.events & posix.POLL.OUT == posix.POLL.OUT) {
+                    const written = client.write() catch {
+                        self.removeClient(i);
+                        continue;
+                    };
+                    if (written) {
+                        // and if the entire message was written, we revert to read-mode.
+                        self.client_polls[i].events = posix.POLL.IN;
+                    }
                 }
             }
+        }
+    }
+
+    fn enforeTimeout(self: *Server) i32 {
+        const now = std.time.milliTimestamp();
+        var node = self.read_timeou_list.first;
+        while (node) |n| {
+            const client = n.data;
+            const diff = client.read_timeout - now;
+            if (diff > 0) {
+                return @intCast(diff);
+            }
+
+            posix.shutdown(client.Socket, .recv) catch {};
+            node = n.next;
+        } else {
+            return -1;
         }
     }
 };
