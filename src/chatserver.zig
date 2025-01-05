@@ -88,9 +88,10 @@ pub const ChatSever = struct {
                             break;
                         };
                         print("msg:{s}\n", .{msg});
+                    } else {
+                        i += 1;
+                        break;
                     }
-                    i += 1;
-                    break;
                 }
             }
         }
@@ -104,7 +105,7 @@ pub const ChatSever = struct {
             else => return err,
         };
         print("Accepted client {any}.\n", .{address.any});
-        self.conn_pool[self.connected] = ChatClient.init(self.alloc, client, address, 4096) catch |err| {
+        self.conn_pool[self.connected] = ChatClient.init(self.alloc, client, address, 1024) catch |err| {
             posix.close(client);
             return err;
         };
@@ -153,8 +154,9 @@ pub const ChatClient = struct {
     }
 
     pub fn readMessage(self: *ChatClient) !?[]u8 {
-        const msg = self.reader.readMessage(self.client) catch {
-            return null;
+        const msg = self.reader.readMessage(self.client) catch |err| switch (err) {
+            ServerError.MessageTooLarge => return err,
+            else => return null,
         };
         return msg;
     }
@@ -179,45 +181,50 @@ pub const Reader = struct {
 
     pub fn readMessage(self: *Reader, client: Socket) !?[]u8 {
         // NO buffered messages.
-        if (self.start >= self.pos) {
-            self.start = 0;
-            self.pos = self.readToBuffer(client, self.start) catch |err| switch (err) {
+        print("Starting reading. Start:{} , Pos:{}\n", .{ self.start, self.pos });
+
+        if (self.start == self.pos) {
+            self.pos += self.readToBuffer(client, self.start) catch |err| switch (err) {
                 error.WouldBlock => return null,
                 else => return err,
             };
         }
 
-        print("Start:{} , Pos:{}\n", .{ self.start, self.pos });
+        if (self.pos > 0 and self.pos > self.start) {
+            if (self.start >= self.pos) {
+                return null;
+            }
 
-        return self.buffer[self.start + 4 .. self.pos];
-    }
+            var unprocessed = self.buffer[self.start..];
+            const size = std.mem.readInt(u32, unprocessed[0..4], .little);
 
-    pub fn bufferedMessage(self: *Reader) ServerError!?[]u8 {
-        if (self.start >= self.pos) {
-            return null;
-        }
-        var unprocessed = self.buffer[self.start..];
-        const size = std.mem.readInt(u32, unprocessed[0..4], .little);
-        const pos = self.start + size;
+            if (size >= self.buffer.len) {
+                return ServerError.MessageTooLarge;
+            }
 
-        if (pos >= self.buffer.len) {
-            return ServerError.MessageTooLarge;
-        }
-        if (pos >= unprocessed) {
-            std.mem.copyForwards(u8, self.buffer[0..unprocessed.len], unprocessed[0..]);
-            self.start = 0;
-            self.pos = unprocessed.len;
+            if (size + 4 >= unprocessed.len) {
+                print("unprocessed.len: {}, Start:{} , Size:{}\n", .{ unprocessed.len, self.start, size });
+                std.mem.copyForwards(u8, self.buffer[0..unprocessed.len], unprocessed[0..]);
+                self.start = 0;
+                self.pos = unprocessed.len;
+
+                self.pos += self.readToBuffer(client, self.pos) catch |err| switch (err) {
+                    error.WouldBlock => return null,
+                    else => return err,
+                };
+                unprocessed = self.buffer[0..];
+            }
+            self.start += 4 + size;
+            print("Start:{} , Pos:{}\n", .{ self.start, self.pos });
+            return unprocessed[4 .. size + 4];
         }
 
-        if (size == 0) {
-            self.start += 4;
-            return null;
-        }
+        unreachable;
     }
 
     fn readToBuffer(self: *Reader, client: Socket, start: usize) !usize {
         const read = posix.read(client, self.buffer[start..]) catch |err| switch (err) {
-            error.WouldBlock => return,
+            error.WouldBlock => return err,
             else => return err,
         };
         return read;
